@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from rdkit import Chem
 from tfrecord.torch.dataset import TFRecordDataset
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -116,8 +117,19 @@ class DFTMetadataDataset(IterableDataset[dict[str, Any]]):
         return str(value)
 
     @staticmethod
+    def _is_valid_smiles_graph(smiles: str) -> bool:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return False
+            Chem.GetAdjacencyMatrix(mol, useBO=True)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def _to_sample(example: dict[str, Any]) -> dict[str, Any]:
-        return {
+        sample = {
             "key_hash": DFTMetadataDataset._decode_text(example["key_hash"]),
             "chemical_formula": DFTMetadataDataset._decode_text(
                 example["chemical_formula"]
@@ -140,6 +152,7 @@ class DFTMetadataDataset(IterableDataset[dict[str, Any]]):
             ),
             "num_atoms": int(DFTForceFieldDataset._as_scalar(example["num_atoms"])),
         }
+        return sample
 
     def __iter__(self):
         for shard in self.shards:
@@ -150,7 +163,9 @@ class DFTMetadataDataset(IterableDataset[dict[str, Any]]):
                 transform=self._to_sample,
                 shuffle_queue_size=None,
             )
-            yield from shard_ds
+            for sample in shard_ds:
+                if self._is_valid_smiles_graph(sample["smiles"]):
+                    yield sample
 
 
 def collate_force_field(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -201,35 +216,42 @@ def collate_metadata(batch: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-class AtomCountBatchedDataset(IterableDataset[dict[str, Any]]):
-    """Groups samples by atom count and emits homogeneous pre-batched dicts."""
-
-    def __init__(
-        self,
-        base_dataset: IterableDataset[dict[str, Any]],
-        batch_size: int,
-        drop_last: bool = True,
-    ) -> None:
-        self.base_dataset = base_dataset
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-
-    def __iter__(self):
-        buffers: dict[int, list[dict[str, Any]]] = {}
-
-        for sample in self.base_dataset:
-            atom_count = int(sample["positions"].shape[0])
-            bucket = buffers.setdefault(atom_count, [])
-            bucket.append(sample)
-
-            if len(bucket) == self.batch_size:
-                yield collate_force_field(bucket)
-                buffers[atom_count] = []
-
-        if not self.drop_last:
-            for bucket in buffers.values():
-                if bucket:
-                    yield collate_force_field(bucket)
+def collate_joined(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "key_hash": [item["key_hash"] for item in batch],
+        "positions": [item["positions"] for item in batch],
+        "pbe0_forces": [item["pbe0_forces"] for item in batch],
+        "atomic_numbers": [item["atomic_numbers"] for item in batch],
+        "charge": torch.tensor([item["charge"] for item in batch], dtype=torch.int64),
+        "multiplicity": torch.tensor(
+            [item["multiplicity"] for item in batch], dtype=torch.int64
+        ),
+        "is_outlier": torch.tensor(
+            [item["is_outlier"] for item in batch], dtype=torch.bool
+        ),
+        "pbe0_energy": torch.tensor(
+            [item["pbe0_energy"] for item in batch], dtype=torch.float32
+        ),
+        "pbe0_formation_energy": torch.tensor(
+            [item["pbe0_formation_energy"] for item in batch], dtype=torch.float32
+        ),
+        "chemical_formula": [item["chemical_formula"] for item in batch],
+        "smiles_hash": [item["smiles_hash"] for item in batch],
+        "smiles": [item["smiles"] for item in batch],
+        "molecular_weight": torch.tensor(
+            [item["molecular_weight"] for item in batch], dtype=torch.float32
+        ),
+        "conformation_seq": torch.tensor(
+            [item["conformation_seq"] for item in batch], dtype=torch.int64
+        ),
+        "conformation_parent_seq": torch.tensor(
+            [item["conformation_parent_seq"] for item in batch], dtype=torch.int64
+        ),
+        "num_heavy_atoms": torch.tensor(
+            [item["num_heavy_atoms"] for item in batch], dtype=torch.int64
+        ),
+        "num_atoms": torch.tensor([item["num_atoms"] for item in batch], dtype=torch.int64),
+    }
 
 
 class KeyHashZippedDataset(IterableDataset[dict[str, Any]]):
@@ -244,32 +266,23 @@ class KeyHashZippedDataset(IterableDataset[dict[str, Any]]):
         self.metadata_dataset = metadata_dataset
 
     def __iter__(self):
-        for ff, md in zip(self.force_field_dataset, self.metadata_dataset):
-            if ff["key_hash"] != md["key_hash"]:
-                raise ValueError(
-                    "Key mismatch between force_field and metadata streams: "
-                    f"{ff['key_hash']} != {md['key_hash']}"
-                )
-            yield {**ff, **md}
+        ff_iter = iter(self.force_field_dataset)
+        md_iter = iter(self.metadata_dataset)
 
+        ff = next(ff_iter, None)
+        md = next(md_iter, None)
 
-def load_data(
-    dataset_dir: Path | str = DATASET_DIR,
-    batch_size: int = 64,
-    num_workers: int = 0,
-    drop_last: bool = True,
-) -> DataLoader:
-    dataset = DFTForceFieldDataset(dataset_dir=dataset_dir)
-    batched_dataset = AtomCountBatchedDataset(
-        base_dataset=dataset,
-        batch_size=batch_size,
-        drop_last=drop_last,
-    )
-    return DataLoader(
-        batched_dataset,
-        batch_size=None,
-        num_workers=num_workers,
-    )
+        while ff is not None and md is not None:
+            ff_key = ff["key_hash"]
+            md_key = md["key_hash"]
+            if ff_key == md_key:
+                yield {**ff, **md}
+                ff = next(ff_iter, None)
+                md = next(md_iter, None)
+            elif ff_key < md_key:
+                ff = next(ff_iter, None)
+            else:
+                md = next(md_iter, None)
 
 
 def load_metadata_data(
@@ -291,18 +304,13 @@ def load_joined_data(
     metadata_dir: Path | str = METADATA_DIR,
     batch_size: int = 64,
     num_workers: int = 0,
-    drop_last: bool = True,
 ) -> DataLoader:
     force_field_dataset = DFTForceFieldDataset(force_field_dir)
     metadata_dataset = DFTMetadataDataset(metadata_dir)
     zipped = KeyHashZippedDataset(force_field_dataset, metadata_dataset)
-    batched_dataset = AtomCountBatchedDataset(
-        base_dataset=zipped,
-        batch_size=batch_size,
-        drop_last=drop_last,
-    )
     return DataLoader(
-        batched_dataset,
-        batch_size=None,
+        zipped,
+        batch_size=batch_size,
         num_workers=num_workers,
+        collate_fn=collate_joined,
     )

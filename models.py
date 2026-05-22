@@ -14,10 +14,12 @@ class Attention(nn.Module):
         self.Wk = nn.Linear(embed_dim, embed_dim)
         self.Wv = nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, mask):
         Q = self.Wq(q)
         K = self.Wk(k)
-        attn = F.softmax(Q @ K.transpose(-2, -1) / math.sqrt(self.embed_dim), dim=-1)
+        attn = Q @ K.transpose(-2, -1) / math.sqrt(self.embed_dim)
+        attn = attn.masked_fill(mask == 0, float("-inf"))
+        attn = F.softmax(attn, dim=-1)
         return attn @ self.Wv(v)
 
 
@@ -25,14 +27,20 @@ class TransformerLayer(nn.Module):
     def __init__(self, embed_dim: int):
         super().__init__()
         self.attn = Attention(embed_dim)
-        self.mlp = nn.Linear(embed_dim, embed_dim)
-
-    def forward(self, x, x_mask):
-        return x + x_mask * F.relu(
-            self.mlp(
-                self.attn(x, x, x),
-            ),
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            *[
+                nn.Linear(embed_dim, 4 * embed_dim),
+                nn.ReLU(),
+                nn.Linear(4 * embed_dim, embed_dim),
+            ]
         )
+
+    def forward(self, x, mask):
+        x = self.ln1(x)
+        x = x + self.attn(x, x, x, mask)
+        return self.mlp(self.ln2(x))
 
 
 class EnergyNet(nn.Module):
@@ -47,16 +55,41 @@ class EnergyNet(nn.Module):
         self.energy_mlp = nn.Linear(embed_dim, 1)
 
     def forward(self, atoms, positions, atom_mask):
-        padding = torch.zeros(atoms.shape[0], self.n_atom_max - atoms.shape[1]).to(
-            atoms.device
-        )
-        atoms = torch.cat([atoms, padding], dim=1)
-        positions = torch.cat(
-            [positions, padding.unsqueeze(2).expand(-1, -1, 3)],
-            dim=1,
-        )
         x = torch.cat([atoms.unsqueeze(2), positions], dim=2)
         x = self.embedding(x.view(x.shape[0], -1))
         for layer in self.transformers:
             x = layer(x, atom_mask)
         return self.energy_mlp(x)
+
+
+class MolGraph(nn.Module):
+    def __init__(
+        self,
+        mol_size: int,
+        node_embed_dim: int,
+        edge_embed_dim: int,
+        n_readout_depth: int,
+    ):
+        super().__init__()
+
+        self.mol_size = mol_size
+        self.node_embed_dim = node_embed_dim
+        self.edge_embed_dim = edge_embed_dim
+
+        self.node_embed = nn.Embedding(
+            self.mol_size,
+            self.node_embed_dim,
+        )
+
+        # TODO decide if I can do this all as a single sparse matrix op, or if I need to break it into a loop over active edges
+        self.M = nn.Sequential()
+        self.R_transformers = nn.ModuleList(
+            [TransformerLayer(self.node_embed_dim) for _ in range(n_readout_depth)]
+        )
+        self.R_linear = nn.Linear(self.mol_size * self.node_embed_dim, 1)
+
+    def forward(self, atoms, positions, mol_graphs):
+        x = self.node_embed(atoms)
+        for layer in self.R_transformers:
+            x = layer(x, mol_graphs)
+        return self.R_linear(x.view(x.shape[0], -1)).squeeze()
