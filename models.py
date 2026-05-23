@@ -7,12 +7,13 @@ from torch import nn
 
 class Attention(nn.Module):
     # TODO: learn about / add dropout
-    def __init__(self, embed_dim: int):
+    def __init__(self, embed_dim: int, p_dropout: float = 0):
         super().__init__()
         self.embed_dim = embed_dim
         self.Wq = nn.Linear(embed_dim, embed_dim)
         self.Wk = nn.Linear(embed_dim, embed_dim)
         self.Wv = nn.Linear(embed_dim, embed_dim)
+        self.p_dropout = p_dropout
 
     def forward(self, q, k, v, mask):
         Q = self.Wq(q)
@@ -20,6 +21,7 @@ class Attention(nn.Module):
         attn = Q @ K.transpose(-2, -1) / math.sqrt(self.embed_dim)
         attn = attn.masked_fill(mask == 0, float("-inf"))
         attn = F.softmax(attn, dim=-1)
+        attn = F.dropout(attn, p=self.p_dropout)
         return attn @ self.Wv(v)
 
 

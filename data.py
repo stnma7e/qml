@@ -285,12 +285,31 @@ class KeyHashZippedDataset(IterableDataset[dict[str, Any]]):
                 md = next(md_iter, None)
 
 
+class LimitedIterableDataset(IterableDataset[dict[str, Any]]):
+    def __init__(
+        self,
+        dataset: IterableDataset[dict[str, Any]],
+        max_examples: int,
+    ) -> None:
+        self.dataset = dataset
+        self.max_examples = max_examples
+
+    def __iter__(self):
+        for i, example in enumerate(self.dataset):
+            if i >= self.max_examples:
+                break
+            yield example
+
+
 def load_metadata_data(
     dataset_dir: Path | str = METADATA_DIR,
     batch_size: int = 64,
     num_workers: int = 0,
+    max_examples: int | None = None,
 ) -> DataLoader:
     dataset = DFTMetadataDataset(dataset_dir=dataset_dir)
+    if max_examples is not None:
+        dataset = LimitedIterableDataset(dataset, max_examples)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -304,10 +323,13 @@ def load_joined_data(
     metadata_dir: Path | str = METADATA_DIR,
     batch_size: int = 64,
     num_workers: int = 0,
+    max_examples: int | None = None,
 ) -> DataLoader:
     force_field_dataset = DFTForceFieldDataset(force_field_dir)
     metadata_dataset = DFTMetadataDataset(metadata_dir)
     zipped = KeyHashZippedDataset(force_field_dataset, metadata_dataset)
+    if max_examples is not None:
+        zipped = LimitedIterableDataset(zipped, max_examples)
     return DataLoader(
         zipped,
         batch_size=batch_size,

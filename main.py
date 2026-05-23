@@ -29,7 +29,7 @@ model = models.MolGraph(
 ).to(device)
 optim = torch.optim.AdamW(
     model.parameters(),
-    lr=1e-3,
+    lr=1e-4,
 )
 loss_fn = nn.MSELoss()
 
@@ -47,16 +47,24 @@ def _bucket_atom_positions(batch_positions):
 
 
 BATCH_SIZE = 256
-n_epochs = 1
+n_epochs = 100
 torch.manual_seed(2026)
-dataloader = data.load_joined_data(batch_size=BATCH_SIZE)
+dataloader = data.load_joined_data(batch_size=BATCH_SIZE, max_examples=100_000)
+
+target_norms = {
+    "pbe0_energy": {
+        "count": 33496171,
+        "mean": -2443.8402999739274,
+        "std": 4265.76866428051,
+    }
+}
 
 batch = next(iter(dataloader))
 
 for epoch in range(n_epochs):
     model.train()
-    # for i, example in enumerate(dataloader):
-    for i, example in [(i, batch) for i in range(int(1e4))]:
+    for i, example in enumerate(dataloader):
+        # for i, example in [(i, batch) for i in range(int(1e4))]:
         # print(example.keys())
         atoms = torch.stack(
             [
@@ -89,6 +97,9 @@ for epoch in range(n_epochs):
         # print(mol_graphs)
         pred = model(atoms.to(device), positions.to(device), mol_graphs.to(device))
         target = torch.tensor(example["pbe0_energy"]).to(device)
+        target = (target - target_norms["pbe0_energy"]["mean"]) / (
+            target_norms["pbe0_energy"]["std"]
+        )
         # print(pred.shape, target.shape)
         loss = loss_fn(pred, target)
         optim.zero_grad()
@@ -103,10 +114,11 @@ for epoch in range(n_epochs):
 
         optim.step()
 
-        with torch.no_grad():
-            if i % 100 == 0:
-                relative_acc = torch.mean(torch.abs(pred - target) / target)
-                print(
-                    relative_acc,
-                    loss / BATCH_SIZE,
-                )
+        if i % 1000 == 0:
+            relative_err = torch.mean(
+                torch.abs(pred - target) / target.abs().clamp_min(1e-12)
+            )
+            print(
+                loss.item(),
+                relative_err.item(),
+            )
