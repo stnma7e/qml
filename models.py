@@ -70,28 +70,79 @@ class MolGraph(nn.Module):
         mol_size: int,
         node_embed_dim: int,
         edge_embed_dim: int,
+        n_mp_phases: int,
         n_readout_depth: int,
+        n_atom_classes: int = 130,
     ):
         super().__init__()
 
         self.mol_size = mol_size
         self.node_embed_dim = node_embed_dim
         self.edge_embed_dim = edge_embed_dim
+        self.n_mp_phases = n_mp_phases
 
         self.node_embed = nn.Embedding(
-            self.mol_size,
+            n_atom_classes,
             self.node_embed_dim,
         )
 
-        # TODO decide if I can do this all as a single sparse matrix op, or if I need to break it into a loop over active edges
-        self.M = nn.Sequential()
+        # this is not the MPNN M function
+        # theirs learns a matrix A(e_vv) and multiplies against the node embedding h
+        self.M = nn.Sequential(
+            *[
+                nn.Linear(
+                    self.node_embed_dim + self.edge_embed_dim,
+                    4 * self.node_embed_dim + self.edge_embed_dim,
+                ),
+                nn.ReLU(),
+                nn.Linear(
+                    4 * self.node_embed_dim + self.edge_embed_dim,
+                    self.node_embed_dim + self.edge_embed_dim,
+                ),
+            ]
+        )
+        self.U = nn.Sequential(
+            *[
+                nn.Linear(
+                    self.node_embed_dim + self.edge_embed_dim,
+                    4 * self.node_embed_dim + self.edge_embed_dim,
+                ),
+                nn.ReLU(),
+                nn.Linear(
+                    4 * self.node_embed_dim + self.edge_embed_dim,
+                    self.node_embed_dim,
+                ),
+            ]
+        )
         self.R_transformers = nn.ModuleList(
             [TransformerLayer(self.node_embed_dim) for _ in range(n_readout_depth)]
         )
         self.R_linear = nn.Linear(self.mol_size * self.node_embed_dim, 1)
 
-    def forward(self, atoms, positions, mol_graphs):
-        x = self.node_embed(atoms)
+    def forward(self, atoms, edges, mol_graphs):
+        atom_embeddings = self.node_embed(atoms)
+        # TODO decide if I can do this all as a single sparse matrix op, or if I need to break it into a loop over active edges
+        for phase in range(self.n_mp_phases):
+            for atom in range(atom_embeddings.shape[1]):
+                messages = torch.zeros(
+                    (
+                        atoms.shape[0],
+                        self.node_embed_dim + self.edge_embed_dim,
+                    )
+                ).to(atoms.device)
+                for other in range(atom_embeddings.shape[1]):
+                    messages += self.M(
+                        torch.cat(
+                            (
+                                atom_embeddings[:, other],
+                                edges[:, atom, other],
+                            ),
+                            dim=1,
+                        ),
+                    )
+                atom_embeddings[:, atom] += self.U(messages)
+
+        x = atom_embeddings
         for layer in self.R_transformers:
             x = layer(x, mol_graphs)
         return self.R_linear(x.view(x.shape[0], -1)).squeeze()

@@ -24,7 +24,8 @@ model = models.EnergyNet(
 model = models.MolGraph(
     mol_size=N_ATOM_MAX,
     node_embed_dim=64,
-    edge_embed_dim=64,
+    edge_embed_dim=10,
+    n_mp_phases=4,
     n_readout_depth=2,
 ).to(device)
 optim = torch.optim.AdamW(
@@ -49,7 +50,7 @@ def _bucket_atom_positions(batch_positions):
 BATCH_SIZE = 256
 n_epochs = 100
 torch.manual_seed(2026)
-dataloader = data.load_joined_data(batch_size=BATCH_SIZE, max_examples=100_000)
+dataloader = data.load_joined_data(batch_size=BATCH_SIZE, max_examples=1_000)
 
 target_norms = {
     "pbe0_energy": {
@@ -94,7 +95,7 @@ for epoch in range(n_epochs):
         )
         # print(atoms.shape)
         # print(positions.shape)
-        # print(mol_graphs)
+        # print(mol_graphs.shape)
         pred = model(atoms.to(device), positions.to(device), mol_graphs.to(device))
         target = torch.tensor(example["pbe0_energy"]).to(device)
         target = (target - target_norms["pbe0_energy"]["mean"]) / (
