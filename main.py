@@ -91,19 +91,25 @@ target_norms = {
         "count": 33496171,
         "mean": -2443.8402999739274,
         "std": 4265.76866428051,
-    }
+    },
+    "pbe0_formation_energy": {
+        "count": 33496171,
+        "mean": -1.750654284213469,
+        "std": 0.8610489154378447,
+    },
 }
 
 
 def _normalize_energy(energy):
-    return (energy - target_norms["pbe0_energy"]["mean"]) / (
-        target_norms["pbe0_energy"]["std"]
+    return (energy - target_norms["pbe0_formation_energy"]["mean"]) / (
+        target_norms["pbe0_formation_energy"]["std"]
     )
 
 
 def _energy_metrics(pred, target_energy):
     pred_energy = (
-        pred * target_norms["pbe0_energy"]["std"] + target_norms["pbe0_energy"]["mean"]
+        pred * target_norms["pbe0_formation_energy"]["std"]
+        + target_norms["pbe0_formation_energy"]["mean"]
     )
     mae = torch.mean(torch.abs(pred_energy - target_energy))
     rmse = torch.sqrt(torch.mean((pred_energy - target_energy) ** 2))
@@ -154,7 +160,7 @@ for epoch in range(n_epochs):
         # print(positions.shape)
         # print(mol_graphs.shape)
         pred = model(atoms.to(device), positions.to(device), mol_graphs.to(device))
-        target_energy = example["pbe0_energy"].to(device)
+        target_energy = example["pbe0_formation_energy"].to(device)
         target = _normalize_energy(target_energy)
         # print(pred.shape, target.shape)
         loss = loss_fn(pred, target)
@@ -193,7 +199,7 @@ for epoch in range(n_epochs):
                     pred = model(
                         atoms.to(device), positions.to(device), mol_graphs.to(device)
                     )
-                    target_energy = example["pbe0_energy"].to(device)
+                    target_energy = example["pbe0_formation_energy"].to(device)
                     target = _normalize_energy(target_energy)
                     loss = loss_fn(pred, target)
                     relative_err = torch.mean(
