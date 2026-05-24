@@ -28,7 +28,7 @@ def _add_tensorboard_logs(logger: tb.SummaryWriter, metrics, step, mode="train")
 
 
 N_ATOM_MAX = 32
-lr = 1e-5
+lr = 1e-4
 node_embed_dim = 64
 n_mp_phases = 4
 n_readout_depth = 2
@@ -44,6 +44,7 @@ model = models.MolGraph(
     n_mp_phases=n_mp_phases,
     n_readout_depth=n_readout_depth,
 ).to(device)
+model.compile()
 optim = torch.optim.AdamW(
     model.parameters(),
     lr=lr,
@@ -56,7 +57,7 @@ print(sum([p.numel() for p in model.parameters()]))
 exp_dir = "logs"
 log_dir = (
     Path(exp_dir)
-    / f"{datetime.now().strftime('%m%d_%H%M%S')}_{lr=}{node_embed_dim=}{n_mp_phases}{n_readout_depth}"
+    / f"{datetime.now().strftime('%m%d_%H%M%S')}_{lr=}{node_embed_dim=}{n_mp_phases=}{n_readout_depth=}"
 )
 logger = tb.SummaryWriter(log_dir)
 
@@ -94,6 +95,21 @@ target_norms = {
 }
 
 
+def _normalize_energy(energy):
+    return (energy - target_norms["pbe0_energy"]["mean"]) / (
+        target_norms["pbe0_energy"]["std"]
+    )
+
+
+def _energy_metrics(pred, target_energy):
+    pred_energy = (
+        pred * target_norms["pbe0_energy"]["std"] + target_norms["pbe0_energy"]["mean"]
+    )
+    mae = torch.mean(torch.abs(pred_energy - target_energy))
+    rmse = torch.sqrt(torch.mean((pred_energy - target_energy) ** 2))
+    return mae, rmse
+
+
 def _transform_example(example):
     # print(example.keys())
     atoms = torch.stack(
@@ -127,7 +143,7 @@ test_batch = next(iter(train_loader))
 global_step = 0
 for epoch in range(n_epochs):
     model.train()
-    train_metrics = {"loss": 0.0, "err": 0.0}
+    train_metrics = {"loss": 0.0, "err": 0.0, "mae": 0.0, "rmse": 0.0}
     for example in train_loader:
         try:
             atoms, positions, mol_graphs = _transform_example(example)
@@ -138,10 +154,8 @@ for epoch in range(n_epochs):
         # print(positions.shape)
         # print(mol_graphs.shape)
         pred = model(atoms.to(device), positions.to(device), mol_graphs.to(device))
-        target = example["pbe0_energy"].to(device)
-        target = (target - target_norms["pbe0_energy"]["mean"]) / (
-            target_norms["pbe0_energy"]["std"]
-        )
+        target_energy = example["pbe0_energy"].to(device)
+        target = _normalize_energy(target_energy)
         # print(pred.shape, target.shape)
         loss = loss_fn(pred, target)
         optim.zero_grad()
@@ -151,18 +165,23 @@ for epoch in range(n_epochs):
         relative_err = torch.mean(
             torch.abs(pred - target) / target.abs().clamp_min(1e-12)
         )
+        mae, rmse = _energy_metrics(pred, target_energy)
 
         train_metrics["loss"] += loss.item()
         train_metrics["err"] += relative_err.item()
+        train_metrics["mae"] += mae.item()
+        train_metrics["rmse"] += rmse.item()
 
         global_step += 1
         if global_step == 1 or global_step % 100 == 0:
             print(
-                loss.item(),
-                relative_err.item(),
+                f"loss={loss.item():.6f}",
+                f"rel_err={relative_err.item():.6f}",
+                f"mae={mae.item():.6f}",
+                f"rmse={rmse.item():.6f}",
             )
 
-            val_metrics = {"loss": 0.0, "err": 0.0}
+            val_metrics = {"loss": 0.0, "err": 0.0, "mae": 0.0, "rmse": 0.0}
             with torch.inference_mode():
                 model.eval()
                 for example in val_loader:
@@ -174,22 +193,27 @@ for epoch in range(n_epochs):
                     pred = model(
                         atoms.to(device), positions.to(device), mol_graphs.to(device)
                     )
-                    target = example["pbe0_energy"].to(device)
-                    target = (target - target_norms["pbe0_energy"]["mean"]) / (
-                        target_norms["pbe0_energy"]["std"]
-                    )
+                    target_energy = example["pbe0_energy"].to(device)
+                    target = _normalize_energy(target_energy)
                     loss = loss_fn(pred, target)
                     relative_err = torch.mean(
                         torch.abs(pred - target) / target.abs().clamp_min(1e-12)
                     )
+                    mae, rmse = _energy_metrics(pred, target_energy)
 
                     val_metrics["loss"] += loss.item()
                     val_metrics["err"] += relative_err.item()
+                    val_metrics["mae"] += mae.item()
+                    val_metrics["rmse"] += rmse.item()
 
             val_metrics["loss"] /= len(val_loader)
             val_metrics["err"] /= len(val_loader)
+            val_metrics["mae"] /= len(val_loader)
+            val_metrics["rmse"] /= len(val_loader)
             train_metrics["loss"] /= 100
             train_metrics["err"] /= 100
+            train_metrics["mae"] /= 100
+            train_metrics["rmse"] /= 100
             _add_tensorboard_logs(logger, train_metrics, global_step)
             _add_tensorboard_logs(logger, val_metrics, global_step, mode="val")
-            train_metrics = {"loss": 0.0, "err": 0.0}
+            train_metrics = {"loss": 0.0, "err": 0.0, "mae": 0.0, "rmse": 0.0}
