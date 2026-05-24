@@ -30,8 +30,8 @@ def _add_tensorboard_logs(logger: tb.SummaryWriter, metrics, step, mode="train")
 N_ATOM_MAX = 32
 lr = 1e-4
 node_embed_dim = 64
-n_mp_phases = 4
-n_readout_depth = 2
+n_mp_phases = 16
+n_readout_depth = 8
 model = models.EnergyNet(
     n_atom_max=N_ATOM_MAX,
     embed_dim=64,
@@ -74,8 +74,8 @@ def _bucket_atom_positions(batch_positions):
 
 
 BATCH_SIZE = 64
-MAX_EXAMPLES = 100_000
-n_epochs = 100
+MAX_EXAMPLES = 10_000
+n_epochs = 30
 torch.manual_seed(2026)
 train_loader, val_loader, test_loader = data.load_joined_data(
     batch_size=BATCH_SIZE,
@@ -84,6 +84,7 @@ train_loader, val_loader, test_loader = data.load_joined_data(
     val_fraction=0.15,
     split_seed=42,
 )
+test_example = next(iter(train_loader))
 
 
 target_norms = {
@@ -98,25 +99,20 @@ target_norms = {
         "std": 0.8610489154378447,
     },
 }
-
-
-def _normalize_energy(energy):
-    return (energy - target_norms["pbe0_formation_energy"]["mean"]) / (
-        target_norms["pbe0_formation_energy"]["std"]
-    )
+TARGET_NAME = "pbe0_formation_energy"
+TARGET_STATS = target_norms[TARGET_NAME]
+METRIC_NAMES = ("loss", "rel_err", "mae", "rmse")
+ACCUM_METRIC_NAMES = ("loss", "rel_err", "mae", "energy_mse")
 
 
 def _energy_metrics(pred, target_energy):
-    pred_energy = (
-        pred * target_norms["pbe0_formation_energy"]["std"]
-        + target_norms["pbe0_formation_energy"]["mean"]
-    )
+    pred_energy = pred * TARGET_STATS["std"] + TARGET_STATS["mean"]
     mae = torch.mean(torch.abs(pred_energy - target_energy))
-    rmse = torch.sqrt(torch.mean((pred_energy - target_energy) ** 2))
-    return mae, rmse
+    energy_mse = torch.mean((pred_energy - target_energy) ** 2)
+    return mae, energy_mse
 
 
-def _transform_example(example):
+def _prepare_batch(example):
     # print(example.keys())
     atoms = torch.stack(
         [
@@ -142,84 +138,85 @@ def _transform_example(example):
             for graph in [torch.tensor(Chem.GetAdjacencyMatrix(Chem.MolFromSmiles(m)))]
         ]
     )
-    return atoms, positions, mol_graphs
+    target_energy = example[TARGET_NAME].to(device)
+    target = (target_energy - TARGET_STATS["mean"]) / TARGET_STATS["std"]
+    return (
+        atoms.to(device),
+        positions.to(device),
+        mol_graphs.to(device),
+        target,
+        target_energy,
+    )
 
 
-test_batch = next(iter(train_loader))
-global_step = 0
+def _compute_metrics(pred, target, target_energy, loss):
+    rel_err = torch.mean(torch.abs(pred - target) / target.abs().clamp_min(1e-12))
+    mae, energy_mse = _energy_metrics(pred, target_energy)
+    return {
+        "loss": loss.item(),
+        "rel_err": rel_err.item(),
+        "mae": mae.item(),
+        "energy_mse": energy_mse.item(),
+    }
+
+
+def _format_metrics(metrics):
+    return " ".join(f"{name}={metrics[name]:.6f}" for name in METRIC_NAMES)
+
+
+def run_epoch(model, loader, *, optimizer=None):
+    is_train = optimizer is not None
+    model.train(is_train)
+
+    totals = {name: 0.0 for name in ACCUM_METRIC_NAMES}
+    n_examples = 0
+
+    context = torch.enable_grad() if is_train else torch.inference_mode()
+    with context:
+        for example in loader:
+            try:
+                atoms, positions, mol_graphs, target, target_energy = _prepare_batch(
+                    example
+                )
+            except Exception as e:
+                print("Skipping batch:", e, file=sys.stderr)
+                continue
+
+            pred = model(atoms, positions, mol_graphs)
+            loss = loss_fn(pred, target)
+            batch_size = target.shape[0]
+
+            if is_train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            metrics = _compute_metrics(pred, target, target_energy, loss)
+            for name, value in metrics.items():
+                totals[name] += value * batch_size
+            n_examples += batch_size
+
+    if n_examples == 0:
+        raise RuntimeError("No batches were processed.")
+
+    metrics = {name: totals[name] / n_examples for name in ACCUM_METRIC_NAMES}
+    metrics["rmse"] = metrics.pop("energy_mse") ** 0.5
+    return metrics
+
+
 for epoch in range(n_epochs):
-    model.train()
-    train_metrics = {"loss": 0.0, "err": 0.0, "mae": 0.0, "rmse": 0.0}
-    for example in train_loader:
-        try:
-            atoms, positions, mol_graphs = _transform_example(example)
-        except Exception as e:
-            print("Skipping batch:", e, file=sys.stderr)
-            continue
-        # print(atoms.shape)
-        # print(positions.shape)
-        # print(mol_graphs.shape)
-        pred = model(atoms.to(device), positions.to(device), mol_graphs.to(device))
-        target_energy = example["pbe0_formation_energy"].to(device)
-        target = _normalize_energy(target_energy)
-        # print(pred.shape, target.shape)
-        loss = loss_fn(pred, target)
-        optim.zero_grad()
-        loss.backward()
-        optim.step()
+    train_metrics = run_epoch(model, train_loader, optimizer=optim)
+    val_metrics = run_epoch(model, val_loader)
 
-        relative_err = torch.mean(
-            torch.abs(pred - target) / target.abs().clamp_min(1e-12)
-        )
-        mae, rmse = _energy_metrics(pred, target_energy)
+    _add_tensorboard_logs(logger, train_metrics, epoch, mode="train")
+    _add_tensorboard_logs(logger, val_metrics, epoch, mode="val")
 
-        train_metrics["loss"] += loss.item()
-        train_metrics["err"] += relative_err.item()
-        train_metrics["mae"] += mae.item()
-        train_metrics["rmse"] += rmse.item()
+    print(
+        f"epoch={epoch + 1}/{n_epochs}",
+        f"train {_format_metrics(train_metrics)}",
+        f"val {_format_metrics(val_metrics)}",
+    )
 
-        global_step += 1
-        if global_step == 1 or global_step % 100 == 0:
-            print(
-                f"loss={loss.item():.6f}",
-                f"rel_err={relative_err.item():.6f}",
-                f"mae={mae.item():.6f}",
-                f"rmse={rmse.item():.6f}",
-            )
-
-            val_metrics = {"loss": 0.0, "err": 0.0, "mae": 0.0, "rmse": 0.0}
-            with torch.inference_mode():
-                model.eval()
-                for example in val_loader:
-                    try:
-                        atoms, positions, mol_graphs = _transform_example(example)
-                    except Exception as e:
-                        print("Skipping batch:", e, file=sys.stderr)
-                        continue
-                    pred = model(
-                        atoms.to(device), positions.to(device), mol_graphs.to(device)
-                    )
-                    target_energy = example["pbe0_formation_energy"].to(device)
-                    target = _normalize_energy(target_energy)
-                    loss = loss_fn(pred, target)
-                    relative_err = torch.mean(
-                        torch.abs(pred - target) / target.abs().clamp_min(1e-12)
-                    )
-                    mae, rmse = _energy_metrics(pred, target_energy)
-
-                    val_metrics["loss"] += loss.item()
-                    val_metrics["err"] += relative_err.item()
-                    val_metrics["mae"] += mae.item()
-                    val_metrics["rmse"] += rmse.item()
-
-            val_metrics["loss"] /= len(val_loader)
-            val_metrics["err"] /= len(val_loader)
-            val_metrics["mae"] /= len(val_loader)
-            val_metrics["rmse"] /= len(val_loader)
-            train_metrics["loss"] /= 100
-            train_metrics["err"] /= 100
-            train_metrics["mae"] /= 100
-            train_metrics["rmse"] /= 100
-            _add_tensorboard_logs(logger, train_metrics, global_step)
-            _add_tensorboard_logs(logger, val_metrics, global_step, mode="val")
-            train_metrics = {"loss": 0.0, "err": 0.0, "mae": 0.0, "rmse": 0.0}
+test_metrics = run_epoch(model, test_loader)
+_add_tensorboard_logs(logger, test_metrics, n_epochs, mode="test")
+print(f"test {_format_metrics(test_metrics)}")
