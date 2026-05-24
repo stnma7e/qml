@@ -127,8 +127,9 @@ class MolGraph(nn.Module):
                 self.node_embed_dim,
                 self.node_embed_dim,
             )
-            edge_matrices = mol_graph_mask.unsqueeze(-1).unsqueeze(-1) * edge_matrices
-            messages = torch.einsum("bijde,bje->bid", edge_matrices, atom_embeddings)
+            messages = torch.einsum(
+                "bijde,bje,bij->bid", edge_matrices, atom_embeddings, mol_graph_mask
+            )
             atom_embeddings = atom_embeddings + self.U(messages)
 
         x = atom_embeddings
