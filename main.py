@@ -13,6 +13,7 @@ from torch.nn import functional as F
 import data
 import models
 
+torch.autograd.set_detect_anomaly(True, check_nan=False)
 device = torch.device("mps")
 
 N_ATOM_MAX = 32

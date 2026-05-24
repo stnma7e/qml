@@ -91,25 +91,25 @@ class MolGraph(nn.Module):
         self.M = nn.Sequential(
             *[
                 nn.Linear(
-                    self.node_embed_dim + self.edge_embed_dim,
-                    4 * self.node_embed_dim + self.edge_embed_dim,
+                    self.edge_embed_dim,
+                    4 * self.edge_embed_dim,
                 ),
                 nn.ReLU(),
                 nn.Linear(
-                    4 * self.node_embed_dim + self.edge_embed_dim,
-                    self.node_embed_dim + self.edge_embed_dim,
+                    4 * self.edge_embed_dim,
+                    self.node_embed_dim * self.node_embed_dim,
                 ),
             ]
         )
         self.U = nn.Sequential(
             *[
                 nn.Linear(
-                    self.node_embed_dim + self.edge_embed_dim,
-                    4 * self.node_embed_dim + self.edge_embed_dim,
+                    self.node_embed_dim,
+                    4 * self.node_embed_dim,
                 ),
                 nn.ReLU(),
                 nn.Linear(
-                    4 * self.node_embed_dim + self.edge_embed_dim,
+                    4 * self.node_embed_dim,
                     self.node_embed_dim,
                 ),
             ]
@@ -122,25 +122,25 @@ class MolGraph(nn.Module):
     def forward(self, atoms, edges, mol_graphs):
         atom_embeddings = self.node_embed(atoms)
         # TODO decide if I can do this all as a single sparse matrix op, or if I need to break it into a loop over active edges
-        for phase in range(self.n_mp_phases):
+        for _ in range(self.n_mp_phases):
+            next_atom_embeddings = []
             for atom in range(atom_embeddings.shape[1]):
                 messages = torch.zeros(
                     (
                         atoms.shape[0],
-                        self.node_embed_dim + self.edge_embed_dim,
+                        self.node_embed_dim,
                     )
                 ).to(atoms.device)
                 for other in range(atom_embeddings.shape[1]):
-                    messages += self.M(
-                        torch.cat(
-                            (
-                                atom_embeddings[:, other],
-                                edges[:, atom, other],
-                            ),
-                            dim=1,
-                        ),
+                    edge_matrix = self.M(edges[:, atom, other].float()).view(
+                        -1, self.node_embed_dim, self.node_embed_dim
                     )
-                atom_embeddings[:, atom] += self.U(messages)
+                    messages += torch.bmm(
+                        edge_matrix,
+                        atom_embeddings[:, other].unsqueeze(-1),
+                    ).squeeze(-1)
+                next_atom_embeddings.append(atom_embeddings[:, atom] + self.U(messages))
+            atom_embeddings = torch.stack(next_atom_embeddings, dim=1)
 
         x = atom_embeddings
         for layer in self.R_transformers:
