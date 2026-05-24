@@ -118,18 +118,25 @@ class MolGraph(nn.Module):
         self.R_linear = nn.Linear(self.mol_size * self.node_embed_dim, 1)
 
     def forward(self, atoms, edges, mol_graph_mask):
+        batch_size = atoms.shape[0]
         atom_embeddings = self.node_embed(atoms)
         for _ in range(self.n_mp_phases):
-            edge_matrices = self.M(edges.float()).view(
-                -1,
-                self.mol_size,
-                self.mol_size,
-                self.node_embed_dim,
-                self.node_embed_dim,
+            batch_idx, dst_idx, src_idx = mol_graph_mask.nonzero(as_tuple=True)
+            active_edges = edges[batch_idx, dst_idx, src_idx].float()
+            active_src_atoms = atom_embeddings[batch_idx, src_idx]
+            active_edge_matrices = self.M(active_edges).view(
+                -1, self.node_embed_dim, self.node_embed_dim
             )
-            messages = torch.einsum(
-                "bijde,bje,bij->bid", edge_matrices, atom_embeddings, mol_graph_mask
+            active_messages = torch.bmm(
+                active_edge_matrices, active_src_atoms.unsqueeze(-1)
+            ).squeeze(-1)
+
+            messages = atom_embeddings.new_zeros(
+                batch_size * self.mol_size, self.node_embed_dim
             )
+            flat_dst_idx = batch_size * self.mol_size + dst_idx
+            messages.index_add_(0, flat_dst_idx, active_messages)
+            messages = messages.view(batch_size, self.mol_size, self.node_embed_dim)
             atom_embeddings = atom_embeddings + self.U(messages)
 
         x = atom_embeddings
