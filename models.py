@@ -86,8 +86,6 @@ class MolGraph(nn.Module):
             self.node_embed_dim,
         )
 
-        # this is not the MPNN M function
-        # theirs learns a matrix A(e_vv) and multiplies against the node embedding h
         self.M = nn.Sequential(
             *[
                 nn.Linear(
@@ -119,30 +117,22 @@ class MolGraph(nn.Module):
         )
         self.R_linear = nn.Linear(self.mol_size * self.node_embed_dim, 1)
 
-    def forward(self, atoms, edges, mol_graphs):
+    def forward(self, atoms, edges, mol_graph_mask):
         atom_embeddings = self.node_embed(atoms)
-        # TODO decide if I can do this all as a single sparse matrix op, or if I need to break it into a loop over active edges
         for _ in range(self.n_mp_phases):
-            next_atom_embeddings = []
-            for atom in range(atom_embeddings.shape[1]):
-                messages = torch.zeros(
-                    (
-                        atoms.shape[0],
-                        self.node_embed_dim,
-                    )
-                ).to(atoms.device)
-                for other in range(atom_embeddings.shape[1]):
-                    edge_matrix = self.M(edges[:, atom, other].float()).view(
-                        -1, self.node_embed_dim, self.node_embed_dim
-                    )
-                    messages += torch.bmm(
-                        edge_matrix,
-                        atom_embeddings[:, other].unsqueeze(-1),
-                    ).squeeze(-1)
-                next_atom_embeddings.append(atom_embeddings[:, atom] + self.U(messages))
-            atom_embeddings = torch.stack(next_atom_embeddings, dim=1)
+            edge_matrices = self.M(edges.float()).view(
+                -1,
+                self.mol_size,
+                self.mol_size,
+                self.node_embed_dim,
+                self.node_embed_dim,
+            )
+            edge_matrices = mol_graph_mask.unsqueeze(-1).unsqueeze(-1) * edge_matrices
+            messages = torch.einsum("bijde,bje->bid", edge_matrices, atom_embeddings)
+            atom_embeddings = atom_embeddings + self.U(messages)
 
         x = atom_embeddings
         for layer in self.R_transformers:
-            x = layer(x, mol_graphs)
-        return self.R_linear(x.view(x.shape[0], -1)).squeeze()
+            x = layer(x, mol_graph_mask)
+        x = self.R_linear(x.view(x.shape[0], -1)).squeeze()
+        return x

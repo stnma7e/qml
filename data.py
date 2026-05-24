@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from rdkit import Chem
 from tfrecord.torch.dataset import TFRecordDataset
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, random_split
 
 DATASET_DIR = Path("data/qcml/dft_force_field/1.0.0")
 METADATA_DIR = Path("data/qcml/dft_metadata/1.0.0")
@@ -139,7 +139,9 @@ class DFTMetadataDataset(IterableDataset[dict[str, Any]]):
             "molecular_weight": float(
                 DFTForceFieldDataset._as_scalar(example["molecular_weight"])
             ),
-            "multiplicity": int(DFTForceFieldDataset._as_scalar(example["multiplicity"])),
+            "multiplicity": int(
+                DFTForceFieldDataset._as_scalar(example["multiplicity"])
+            ),
             "conformation_seq": int(
                 DFTForceFieldDataset._as_scalar(example["conformation_seq"])
             ),
@@ -164,8 +166,8 @@ class DFTMetadataDataset(IterableDataset[dict[str, Any]]):
                 shuffle_queue_size=None,
             )
             for sample in shard_ds:
-                if self._is_valid_smiles_graph(sample["smiles"]):
-                    yield sample
+                # if self._is_valid_smiles_graph(sample["smiles"]):
+                yield sample
 
 
 def collate_force_field(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -212,7 +214,9 @@ def collate_metadata(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "num_heavy_atoms": torch.tensor(
             [item["num_heavy_atoms"] for item in batch], dtype=torch.int64
         ),
-        "num_atoms": torch.tensor([item["num_atoms"] for item in batch], dtype=torch.int64),
+        "num_atoms": torch.tensor(
+            [item["num_atoms"] for item in batch], dtype=torch.int64
+        ),
     }
 
 
@@ -250,7 +254,9 @@ def collate_joined(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "num_heavy_atoms": torch.tensor(
             [item["num_heavy_atoms"] for item in batch], dtype=torch.int64
         ),
-        "num_atoms": torch.tensor([item["num_atoms"] for item in batch], dtype=torch.int64),
+        "num_atoms": torch.tensor(
+            [item["num_atoms"] for item in batch], dtype=torch.int64
+        ),
     }
 
 
@@ -324,15 +330,53 @@ def load_joined_data(
     batch_size: int = 64,
     num_workers: int = 0,
     max_examples: int | None = None,
-) -> DataLoader:
+    train_fraction: float = 0.7,
+    val_fraction: float = 0.15,
+    split_seed: int = 42,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    """Load joined samples and return reproducible train/val/test loaders."""
+    if train_fraction < 0 or val_fraction < 0 or train_fraction + val_fraction > 1:
+        raise ValueError("Split fractions must be non-negative and sum to at most 1.")
+
     force_field_dataset = DFTForceFieldDataset(force_field_dir)
     metadata_dataset = DFTMetadataDataset(metadata_dir)
     zipped = KeyHashZippedDataset(force_field_dataset, metadata_dataset)
     if max_examples is not None:
         zipped = LimitedIterableDataset(zipped, max_examples)
-    return DataLoader(
-        zipped,
+
+    full_dataset = list(zipped)
+    if not full_dataset:
+        raise ValueError("No joined samples were loaded.")
+
+    train_size = int(train_fraction * len(full_dataset))
+    val_size = int(val_fraction * len(full_dataset))
+    test_size = len(full_dataset) - train_size - val_size
+
+    train_data, val_data, test_data = random_split(
+        full_dataset,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(split_seed),
+    )
+
+    train_loader = DataLoader(
+        train_data,
         batch_size=batch_size,
+        shuffle=True,
         num_workers=num_workers,
         collate_fn=collate_joined,
     )
+    val_loader = DataLoader(
+        val_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_joined,
+    )
+    test_loader = DataLoader(
+        test_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_joined,
+    )
+    return train_loader, val_loader, test_loader
